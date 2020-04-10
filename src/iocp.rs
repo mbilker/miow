@@ -5,15 +5,87 @@ use std::fmt;
 use std::io;
 use std::mem;
 use std::os::windows::io::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::handle::Handle;
 use crate::Overlapped;
 use winapi::shared::basetsd::*;
+use winapi::shared::minwindef::{BOOL, DWORD, FALSE};
 use winapi::shared::ntdef::*;
 use winapi::um::handleapi::*;
 use winapi::um::ioapiset::*;
 use winapi::um::minwinbase::*;
+
+fn lookup(module: &str, symbol: &str) -> Option<usize> {
+    use std::ffi::CString;
+
+    use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
+
+    let mut module: Vec<u16> = module.encode_utf16().collect();
+    module.push(0);
+
+    let symbol = CString::new(symbol).unwrap();
+
+    unsafe {
+        let handle = GetModuleHandleW(module.as_ptr());
+
+        match GetProcAddress(handle, symbol.as_ptr()) as usize {
+            0 => None,
+            n => Some(n),
+        }
+    }
+}
+
+fn store_func(ptr: &AtomicUsize, module: &str, symbol: &str, fallback: usize) -> usize {
+    let value = lookup(module, symbol).unwrap_or(fallback);
+    ptr.store(value, Ordering::SeqCst);
+    value
+}
+
+macro_rules! compat_fn {
+    ($module:ident: $(
+        fn $symbol:ident($($argname:ident: $argtype:ty),*$(,)?) -> $rettype:ty {
+            $($body:expr);*
+        }
+    )*) => ($(
+        #[allow(unused_variables)]
+        unsafe fn $symbol($($argname: $argtype),*) -> $rettype {
+            type F = unsafe extern "system" fn($($argtype),*) -> $rettype;
+
+            static PTR: AtomicUsize = AtomicUsize::new(0);
+
+            unsafe extern "system" fn fallback($($argname: $argtype),*) -> $rettype {
+                $($body);*
+            }
+
+            fn load() -> usize {
+                store_func(&PTR, stringify!($module), stringify!($symbol), fallback as usize)
+            }
+
+            let addr = match PTR.load(Ordering::SeqCst) {
+                0 => load(),
+                n => n,
+            };
+            mem::transmute::<usize, F>(addr)($($argname),*)
+        }
+    )*)
+}
+
+compat_fn! {
+    kernel32:
+
+    fn GetQueuedCompletionStatusEx(
+        CompletionPort: HANDLE,
+        lpCompletionPortEntries: *mut OVERLAPPED_ENTRY,
+        ulCount: ULONG,
+        ulNumEntriesRemoved: *mut ULONG,
+        dwMilliseconds: DWORD,
+        fAlertable: BOOL,
+    ) -> BOOL {
+        panic!("GetQueuedCompletionStatusEx not available")
+    }
+}
 
 /// A handle to an Windows I/O Completion Port.
 #[derive(Debug)]
@@ -27,6 +99,7 @@ pub struct CompletionPort {
 /// provided to a completion port, or they are read out of a completion port.
 /// The fields of each status are read through its accessor methods.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct CompletionStatus(OVERLAPPED_ENTRY);
 
 impl fmt::Debug for CompletionStatus {
@@ -144,27 +217,84 @@ impl CompletionPort {
         list: &'a mut [CompletionStatus],
         timeout: Option<Duration>,
     ) -> io::Result<&'a mut [CompletionStatus]> {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Single = 1,
+            Multiple = 2,
+        }
+
+        static KIND: AtomicUsize = AtomicUsize::new(0);
+
         debug_assert_eq!(
             mem::size_of::<CompletionStatus>(),
             mem::size_of::<OVERLAPPED_ENTRY>()
         );
-        let mut removed = 0;
-        let timeout = crate::dur2ms(timeout);
-        let len = cmp::min(list.len(), <ULONG>::max_value() as usize) as ULONG;
-        let ret = unsafe {
-            GetQueuedCompletionStatusEx(
-                self.handle.raw(),
-                list.as_ptr() as *mut _,
-                len,
-                &mut removed,
-                timeout,
-                FALSE as i32,
-            )
-        };
-        match crate::cvt(ret) {
-            Ok(_) => Ok(&mut list[..removed as usize]),
-            Err(e) => Err(e),
+
+        let val = KIND.load(Ordering::SeqCst);
+
+        if val == Kind::Multiple as usize {
+            let mut removed = 0;
+            let timeout = crate::dur2ms(timeout);
+            let len = cmp::min(list.len(), <ULONG>::max_value() as usize) as ULONG;
+            let ret = unsafe {
+                GetQueuedCompletionStatusEx(
+                    self.handle.raw(),
+                    list.as_ptr() as *mut _,
+                    len,
+                    &mut removed,
+                    timeout,
+                    FALSE as i32,
+                )
+            };
+            return match crate::cvt(ret) {
+                Ok(_) => Ok(&mut list[..removed as usize]),
+                Err(e) => Err(e),
+            };
+        } else if val == Kind::Single as usize {
+            let mut timeout = crate::dur2ms(timeout);
+            let mut last_result = None;
+
+            for (i, entry) in list.iter_mut().enumerate() {
+                entry.0.Internal = 0;
+
+                let ret = unsafe {
+                    GetQueuedCompletionStatus(
+                        self.handle.raw(),
+                        &mut entry.0.dwNumberOfBytesTransferred,
+                        &mut entry.0.lpCompletionKey,
+                        &mut entry.0.lpOverlapped,
+                        timeout,
+                    )
+                };
+                let res = crate::cvt(ret);
+
+                // Set the timeout to 0 so all subsequent calls have no timeout
+                timeout = 0;
+
+                if let Err(e) = res {
+                    last_result = Some((i, e));
+                    break;
+                }
+            }
+
+            if let Some((i, e)) = last_result {
+                if i > 0 {
+                    return Ok(&mut list[..i]);
+                } else {
+                    return Err(e);
+                }
+            }
+
+            return Ok(list);
         }
+
+        let ret = match lookup("kernel32", "GetQueuedCompletionStatusEx") {
+            None => Kind::Single,
+            Some(..) => Kind::Multiple,
+        };
+        KIND.store(ret as usize, Ordering::SeqCst);
+
+        self.get_many(list, timeout)
     }
 
     /// Posts a new completion status onto this I/O completion port.
